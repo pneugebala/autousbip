@@ -1,0 +1,203 @@
+#!/bin/bash
+# autousbip-server - bind/unbind USB devices for USB/IP export on the server side.
+#
+# Subcommands (called by udev rules, the boot service, or directly):
+#   udev-add <busid> <vid> <pid>   - hotplug add hook (filters against config, fires async bind)
+#   udev-remove <busid>            - hotplug remove hook (fires async unbind if we manage it)
+#   do-bind <busid>                - perform the actual `usbip bind` (run via systemd-run)
+#   do-unbind <busid>              - perform the actual `usbip unbind` (run via systemd-run)
+#   boot                           - bind every currently-plugged device that matches the config
+#
+# Config:  /etc/autousbip/server.conf  (one "idVendor:idProduct [alias]" per line)
+# State:   /run/autousbip/server/<busid>.bound   (touched on successful bind)
+
+set -uo pipefail
+
+CONFIG="/etc/autousbip/server.conf"
+STATE_DIR="/run/autousbip/server"
+LOG_TAG="autousbip-server"
+
+USBIP_BIN="${USBIP_BIN:-usbip}"
+MODPROBE_BIN="${MODPROBE_BIN:-modprobe}"
+
+log() { logger -t "$LOG_TAG" -- "$*"; echo "[$(date -Is)] $*" >&2; }
+
+# normalize a 4-hex id to lowercase, no whitespace
+norm() { printf '%s' "$1" | tr -d ' \n\t' | tr 'A-F' 'a-f'; }
+
+# Load the kernel modules required to export devices.
+load_modules() {
+    "$MODPROBE_BIN" usbip-core 2>/dev/null || true
+    "$MODPROBE_BIN" usbip-host 2>/dev/null || true
+}
+
+# --- State helpers ------------------------------------------------------
+
+ensure_state_dir() { mkdir -p "$STATE_DIR" 2>/dev/null || true; }
+
+is_managed() {
+    [ -f "${STATE_DIR}/$1.bound" ]
+}
+
+mark_managed() { ensure_state_dir; touch "${STATE_DIR}/$1.bound" 2>/dev/null || true; }
+unmark_managed() { rm -f "${STATE_DIR}/$1.bound" 2>/dev/null || true; }
+
+# True if <busid> is currently bound to the usbip-host driver.
+is_exported() {
+    local busid="$1" drv
+    [ -d "/sys/bus/usb/devices/$busid" ] || return 1
+    drv=$(readlink -f "/sys/bus/usb/devices/$busid/driver" 2>/dev/null)
+    [ "${drv##*/}" = "usbip-host" ]
+}
+
+# --- Config matching ----------------------------------------------------
+
+# matches_config <vid_lc> <pid_lc>   returns 0 if (vid:pid) is listed in CONFIG
+matches_config() {
+    local want_vid="$1" want_pid="$2"
+    [ -f "$CONFIG" ] || return 1
+    local line cfg_vp cfg_vid cfg_pid
+    while IFS= read -r line || [ -n "$line" ]; do
+        # strip comments and whitespace
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [ -z "$line" ] && continue
+        cfg_vp="${line%%[[:space:]]*}"           # first token = vid:pid
+        cfg_vid="$(norm "${cfg_vp%%:*}")"
+        cfg_pid="$(norm "${cfg_vp#*:}")"
+        if [ "$cfg_vid" = "$want_vid" ] && [ "$cfg_pid" = "$want_pid" ]; then
+            return 0
+        fi
+    done < "$CONFIG"
+    return 1
+}
+
+# --- Real bind/unbind (executed by transient systemd units) ------------
+
+do_bind() {
+    local busid="$1"
+    if [ -d "/sys/bus/usb/devices/$busid" ]; then :; else
+        log "do-bind: $busid not present, skipping"
+        unmark_managed "$busid"
+        return 0
+    fi
+    if is_exported "$busid"; then
+        log "$busid: already bound to usbip-host, marking managed"
+        mark_managed "$busid"
+        return 0
+    fi
+    log "$busid: binding..."
+    if "$USBIP_BIN" bind -b "$busid" 2>&1; then
+        mark_managed "$busid"
+        log "$busid: bound"
+        return 0
+    fi
+    log "$busid: usbip bind failed"
+    return 1
+}
+
+do_unbind() {
+    local busid="$1"
+    # Always attempt; device may already be gone (kernel auto-cleans on unplug).
+    # Ignore errors - cleanup is best-effort.
+    if is_exported "$busid" 2>/dev/null; then
+        log "$busid: unbinding..."
+        "$USBIP_BIN" unbind -b "$busid" 2>&1 || log "$busid: unbind reported error (ignored)"
+    else
+        log "$busid: not currently exported, no unbind needed"
+    fi
+    unmark_managed "$busid"
+    return 0
+}
+
+# --- udev hooks (fast, never block; delegate heavy work to systemd-run) -
+
+udev_add() {
+    local busid="$1" vid pid
+    vid="$(norm "$2")"
+    pid="$(norm "$3")"
+    if [ -z "$vid" ] || [ -z "$pid" ]; then
+        # on add we should always have attrs; if not, ignore
+        exit 0
+    fi
+    if ! matches_config "$vid" "$pid"; then
+        exit 0   # not in our export list
+    fi
+    if is_managed "$busid"; then
+        log "$busid ($vid:$pid): already managed, skipping add"
+        exit 0
+    fi
+    # Delegate the real (potentially slow / blocking) bind to a transient
+    # systemd unit so udev does not wait on us.
+    if systemd-run --quiet --no-block --collect \
+            --unit="autousbip-server-bind@${busid}.service" \
+            --property=Type=oneshot \
+            --property=After=autousbip-usbipd.service \
+            -- "$0" do-bind "$busid" >/dev/null 2>&1; then
+        log "$busid ($vid:$pid): scheduled bind"
+    else
+        # Could be already scheduled (unit name collision) - benign.
+        log "$busid ($vid:$pid): could not schedule bind (already scheduled?)"
+    fi
+}
+
+udev_remove() {
+    local busid="$1"
+    if ! is_managed "$busid"; then
+        exit 0   # not one of ours
+    fi
+    log "$busid: device removed, scheduling cleanup"
+    systemd-run --quiet --no-block --collect \
+        --unit="autousbip-server-unbind@${busid}.service" \
+        --property=Type=oneshot \
+        -- "$0" do-unbind "$busid" >/dev/null 2>&1 \
+        || log "$busid: could not schedule unbind (already scheduled?)"
+}
+
+# --- Boot-time scan -----------------------------------------------------
+
+boot() {
+    load_modules
+    ensure_state_dir
+    # usbipd is required to actually serve exports. We just bring up the
+    # kernel side here; the autousbip-usbipd.service unit runs the daemon.
+    log "boot: scanning /sys/bus/usb/devices against $CONFIG"
+    local dev busid vid pid
+    for dev in /sys/bus/usb/devices/*; do
+        [ -d "$dev" ] || continue
+        busid="${dev##*/}"
+        # Skip interfaces (have a ':' in the name like 1-2:1.0)
+        case "$busid" in *:*) continue;; esac
+        [ -r "$dev/idVendor" ] && [ -r "$dev/idProduct" ] || continue
+        vid="$(norm "$(<"$dev/idVendor")")"
+        pid="$(norm "$(<"$dev/idProduct")")"
+        [ -n "$vid" ] && [ -n "$pid" ] || continue
+        if matches_config "$vid" "$pid"; then
+            log "boot: $busid ($vid:$pid) matches config -> bind"
+            do_bind "$busid"
+        fi
+    done
+    log "boot: scan complete"
+}
+
+# --- Entry point --------------------------------------------------------
+
+main() {
+    local cmd="${1:-}"
+    [ -n "$cmd" ] || { echo "usage: $0 {udev-add|udev-remove|do-bind|do-unbind|boot} [args]" >&2; exit 2; }
+    shift
+    case "$cmd" in
+        udev-add)    udev_add    "$@" ;;
+        udev-remove) udev_remove "$@" ;;
+        do-bind)     do_bind    "$@" ;;
+        do-unbind)   do_unbind  "$@" ;;
+        boot)        boot       "$@" ;;
+        *)
+            echo "$0: unknown subcommand: $cmd" >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"

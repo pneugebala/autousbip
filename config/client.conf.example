@@ -1,0 +1,27 @@
+# /etc/autousbip/client.conf
+#
+# Shell-sourced by /usr/local/sbin/autousbip-client.
+# Configure the remote USB/IP server and the devices to import.
+
+# --- Server -------------------------------------------------------------
+# Hostname or IP of the USB/IP server running autousbip-server + usbipd.
+SERVER="192.168.1.10"
+# TCP port the remote usbipd is listening on (default 3240).
+SERVER_PORT="3240"
+
+# --- Polling ------------------------------------------------------------
+# Seconds between status checks once attached / between attach attempts.
+POLL_INTERVAL="5"
+# Seconds to back off after a failed attach attempt.
+RETRY_INTERVAL="10"
+# Seconds to wait for a freshly attached device to enumerate locally.
+ATTACH_SETTLE="2"
+
+# --- Devices to import --------------------------------------------------
+# Bash array. Each entry: "idVendor:idProduct [alias]".
+# vid:pid must match what `usbip list -r $SERVER` advertises (the part
+# in parentheses). The alias is only used in log messages.
+DEVICES=(
+    "046d:c52b   logitech_receiver"
+    "046d:c534"
+)

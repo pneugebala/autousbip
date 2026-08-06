@@ -1,0 +1,21 @@
+[Unit]
+Description=autousbip-client: import USB devices from a remote USB/IP server
+Documentation=man:usbip(8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Load the vhci-hcd module before attaching any remote device.
+ExecStartPre=/sbin/modprobe vhci-hcd
+# Optional: override the config file via systemd override / environment.
+# Environment=AUTOUSBIP_CLIENT_CONFIG=/etc/autousbip/client.conf
+ExecStart=/usr/local/sbin/autousbip-client
+Restart=always
+RestartSec=10
+# Give the loop a generous time budget; it sleeps between polls.
+TimeoutStopSec=15
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+# /etc/autousbip/server.conf
+#
+# Devices to export over USB/IP. The server matches hotplugged devices
+# against this list and automatically binds/unbinds them.
+#
+# Format:  one device per line
+#          idVendor:idProduct  [alias]
+#
+# idVendor and idProduct are 4-digit hex (case-insensitive).
+# Lines starting with '#' and blank lines are ignored.
+# The alias is only used in log messages.
+#
+# Examples:
+#   046d:c52b   logitech_receiver
+#   046d:c534
+#   1bcf:2281   sunplus_720p

@@ -1,0 +1,20 @@
+[Unit]
+Description=USB/IP daemon (server side - exports bound devices to the network)
+Documentation=man:usbipd(8)
+After=systemd-udevd.service
+Wants=systemd-udevd.service
+
+[Service]
+Type=simple
+# Make sure the kernel modules are present before the daemon starts.
+ExecStartPre=/sbin/modprobe usbip-core
+ExecStartPre=/sbin/modprobe usbip-host
+# Run usbipd in the foreground; systemd owns the lifecycle.
+ExecStart=/usr/sbin/usbipd
+Restart=on-failure
+RestartSec=5
+# Bind to a known TCP port (3240 default). Override by editing this unit
+# (or via a drop-in: systemctl edit autousbip-usbipd.service).
+
+[Install]
+WantedBy=multi-user.target

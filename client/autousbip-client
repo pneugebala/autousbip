@@ -1,0 +1,251 @@
+#!/bin/bash
+# autousbip-client - continuously import USB devices from a remote USB/IP server.
+#
+# Behaviour:
+#   * On start, modprobe vhci-hcd and try to attach every device listed in
+#     /etc/autousbip/client.conf.
+#   * For each device, poll the server's export list (`usbip list -r`) and
+#     `usbip attach` whenever a matching busid appears.
+#   * Once attached, monitor the device locally. When it disappears
+#     (server lost / device unplugged / network blip), detach the stale
+#     vhci port and start polling the server again.
+#   * When the server re-advertises the device, automatically re-attach.
+#
+# This script is meant to be run by autousbip-client.service (Type=simple,
+# Restart=always). It is safe to run multiple instances if you give each
+# one a different config via AUTOUSPIP_CLIENT_CONFIG.
+
+set -uo pipefail
+
+CONFIG="${AUTOUSBIP_CLIENT_CONFIG:-/etc/autousbip/client.conf}"
+LOG_TAG="autousbip-client"
+
+USBIP_BIN="${USBIP_BIN:-usbip}"
+MODPROBE_BIN="${MODPROBE_BIN:-modprobe}"
+
+log() { logger -t "$LOG_TAG" -- "$*"; echo "[$(date -Is)] $*" >&2; }
+
+norm() { printf '%s' "$1" | tr -d ' \n\t' | tr 'A-F' 'a-f'; }
+
+# --- Config --------------------------------------------------------------
+
+# Defaults (overridable by config file)
+SERVER=""
+SERVER_PORT="3240"
+POLL_INTERVAL="5"
+RETRY_INTERVAL="10"
+ATTACH_SETTLE="2"
+DEVICES=()
+
+load_config() {
+    [ -f "$CONFIG" ] || { log "ERROR: config not found: $CONFIG"; exit 1; }
+    # shellcheck disable=SC1090
+    source "$CONFIG"
+    : "${SERVER:?SERVER not set in $CONFIG}"
+    [ -n "${SERVER_PORT:-}" ]    || SERVER_PORT="3240"
+    [ -n "${POLL_INTERVAL:-}" ]  || POLL_INTERVAL="5"
+    [ -n "${RETRY_INTERVAL:-}" ] || RETRY_INTERVAL="10"
+    [ -n "${ATTACH_SETTLE:-}" ]   || ATTACH_SETTLE="2"
+    if [ "${#DEVICES[@]}" -eq 0 ]; then
+        log "ERROR: DEVICES array is empty in $CONFIG"; exit 1
+    fi
+}
+
+# Build a normalized array of "vid pid alias" tokens.
+TARGETS=()
+build_targets() {
+    local entry vidpid alias vid pid
+    for entry in "${DEVICES[@]}"; do
+        # Drop surrounding quotes if any, then split into vidpid + alias.
+        entry="${entry//\"/}"
+        read -r vidpid alias _ <<< "$entry"
+        vid="$(norm "${vidpid%%:*}")"
+        pid="$(norm "${vidpid##*:}")"
+        if [ -z "$vid" ] || [ -z "$pid" ]; then
+            log "WARNING: skipping malformed device entry: '$entry'"
+            continue
+        fi
+        TARGETS+=("$vid $pid ${alias:-}")
+    done
+}
+
+# --- Remote enumeration --------------------------------------------------
+
+# resolve_busid <vid_lc> <pid_lc>
+#   Print the server-side busid (e.g. "1-2") of an exported device matching
+#   vid:pid, or empty string if not found / server unreachable.
+resolve_busid() {
+    local vid="$1" pid="$2"
+    # `usbip list -r` output (one entry per exported device):
+    #   - 1-2         : unknown vendor : unknown product (046d:c52b)
+    "$USBIP_BIN" list -r "$SERVER" -p "$SERVER_PORT" 2>/dev/null \
+        | grep -E "\(${vid}:${pid}\)" \
+        | head -n 1 \
+        | sed -E 's/^[[:space:]]*- ([0-9][0-9.:-]*).*$/\1/' \
+        | tr -d ' '
+}
+
+# --- Local attach state --------------------------------------------------
+
+# lsusb output is cached once per main-loop iteration.
+LSUSB_CACHE=""
+
+# is_attached <vid_lc> <pid_lc>   (uses $LSUSB_CACHE)
+is_attached() {
+    [ -n "$LSUSB_CACHE" ] || return 1
+    # lsusb line:  Bus 001 Device 003: ID 046d:c52b Logitech, Inc. ...
+    printf '%s\n' "$LSUSB_CACHE" | grep -qE "ID ${1}:${2}\b"
+}
+
+# find_local_port <vid_lc> <pid_lc>
+#   Print the vhci port number for an attached device, or empty if none.
+find_local_port() {
+    local vid="$1" pid="$2"
+    # `usbip port` output (multi-line per port):
+    #   Port 00: <Port in use at full speed>
+    #          unknown vendor : unknown product (046d:c52b)
+    #          : /sys/devices/platform/vhci_hcd.0/usb1/1-1
+    "$USBIP_BIN" port 2>/dev/null | awk -v v="$vid" -v p="$pid" '
+        BEGIN { v=tolower(v); p=tolower(p) }
+        /^Port [0-9]+:/ { port=$2; sub(/:/, "", port) }
+        /\([0-9a-fA-F]{4}:[0-9a-fA-F]{4}\)/ {
+            line = $0
+            sub(/.*\(/, "", line); sub(/\).*/, "", line)
+            split(line, parts, ":")
+            if (tolower(parts[1]) == v && tolower(parts[2]) == p) print port
+        }
+    ' | head -n 1
+}
+
+# detach_port <vid_lc> <pid_lc>  - best-effort cleanup of a stale vhci port.
+detach_port() {
+    local vid="$1" pid="$2" port
+    port="$(find_local_port "$vid" "$pid")"
+    if [ -z "$port" ]; then
+        return 0
+    fi
+    log "$vid:$pid: detaching stale vhci port $port"
+    "$USBIP_BIN" detach -p "$port" 2>&1 | sed 's/^/  /' >&2 || true
+}
+
+# try_attach <vid_lc> <pid_lc> <busid>   returns 0 if attach command succeeded.
+try_attach() {
+    local vid="$1" pid="$2" busid="$3"
+    log "$vid:$pid: attaching busid $busid from $SERVER:$SERVER_PORT"
+    if "$USBIP_BIN" attach -r "$SERVER" -p "$SERVER_PORT" -b "$busid" 2>&1 | sed 's/^/  /' >&2; then
+        return 0
+    fi
+    return 1
+}
+
+# --- Per-device state ----------------------------------------------------
+# state[key] is one of: "" (initial), "attached", "detached", "waiting",
+#                       "settling"
+declare -A STATE
+
+# --- Main loop -----------------------------------------------------------
+
+run_loop() {
+    log "autousbip-client started: server=$SERVER:$SERVER_PORT, ${#TARGETS[@]} device(s)"
+    "$MODPROBE_BIN" vhci-hcd 2>/dev/null || true
+
+    local t vid pid alias key
+    for t in "${TARGETS[@]}"; do
+        read -r vid pid alias <<< "$t"
+        STATE["$vid:$pid"]="detached"
+    done
+
+    while true; do
+        # Refresh lsusb snapshot once per iteration; tolerate absence of lsusb.
+        if command -v lsusb >/dev/null 2>&1; then
+            LSUSB_CACHE="$(lsusb 2>/dev/null)"
+        else
+            # Fallback: walk sysfs for vhci-hcd devices.
+            LSUSB_CACHE="$(generate_lsusb_fallback)"
+        fi
+
+        for t in "${TARGETS[@]}"; do
+            read -r vid pid alias <<< "$t"
+            key="$vid:$pid"
+            label="${alias:-$key}"
+
+            if is_attached "$vid" "$pid"; then
+                if [ "${STATE[$key]:-}" != "attached" ]; then
+                    log "$label: attached (verified locally)"
+                fi
+                STATE[$key]="attached"
+                continue
+            fi
+
+            # Not attached locally.
+            case "${STATE[$key]:-}" in
+                attached|settling)
+                    log "$label: lost (no longer attached locally), cleaning up"
+                    detach_port "$vid" "$pid"
+                    STATE[$key]="detached"
+                    continue
+                    ;;
+            esac
+
+            # Look for the device on the server.
+            busid="$(resolve_busid "$vid" "$pid")"
+            if [ -z "$busid" ]; then
+                if [ "${STATE[$key]:-}" != "waiting" ]; then
+                    log "$label: not advertised by $SERVER, waiting..."
+                fi
+                STATE[$key]="waiting"
+                continue
+            fi
+
+            if ! try_attach "$vid" "$pid" "$busid"; then
+                log "$label: attach failed (busid $busid), will retry in ${RETRY_INTERVAL}s"
+                detach_port "$vid" "$pid"   # clear any half-bound port
+                STATE[$key]="detached"
+                sleep "$RETRY_INTERVAL"
+                continue
+            fi
+
+            # Wait briefly for the device to enumerate locally.
+            STATE[$key]="settling"
+            local i
+            for ((i=0; i<ATTACH_SETTLE*2; i++)); do
+                sleep 1
+                # Refresh lsusb quickly for the check.
+                if command -v lsusb >/dev/null 2>&1; then
+                    LSUSB_CACHE="$(lsusb 2>/dev/null)"
+                fi
+                if is_attached "$vid" "$pid"; then
+                    log "$label: attached (busid $busid)"
+                    STATE[$key]="attached"
+                    break
+                fi
+            done
+            if [ "${STATE[$key]:-}" = "settling" ]; then
+                log "$label: attach returned ok but device did not enumerate; cleaning up"
+                detach_port "$vid" "$pid"
+                STATE[$key]="detached"
+            fi
+        done
+
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+# Build a synthetic "lsusb-like" string from sysfs as a fallback.
+generate_lsusb_fallback() {
+    local f d v p
+    for f in /sys/devices/platform/vhci_hcd.*/*/usb*/*/idVendor \
+             /sys/devices/platform/vhci_hcd.0/usb*/*/idVendor; do
+        [ -r "$f" ] || continue
+        d="${f%/idVendor}"
+        v="$(norm "$(<"$f")")"   || continue
+        p="$(norm "$(<"$d/idProduct")")" 2>/dev/null || continue
+        printf 'ID %s:%s\n' "$v" "$p"
+    done
+}
+
+# --- Entry point ---------------------------------------------------------
+
+load_config
+build_targets
+run_loop

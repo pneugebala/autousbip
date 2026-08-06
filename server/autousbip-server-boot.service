@@ -1,0 +1,16 @@
+[Unit]
+Description=autousbip-server: bind USB devices already attached at boot
+Documentation=man:usbip(8)
+After=autousbip-usbipd.service systemd-udevd.service
+Requires=autousbip-usbipd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/autousbip-server boot
+RemainAfterExit=yes
+# Re-run whenever the device set or config might have changed.
+ExecReload=/usr/local/sbin/autousbip-server boot
+
+[Install]
+WantedBy=multi-user.target
+Also=autousbip-usbipd.service
