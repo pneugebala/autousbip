@@ -6,16 +6,16 @@ This repo contains scripts, udev rules and systemd units that export a USB
 device from one Linux box (the **server**) and re-attach it on another Linux
 box (the **client**), with no manual `usbip bind`/`usbip attach` steps.
 
-* **Server side**
-  * Auto-binds matching devices to `usbip-host` as soon as they are plugged in
+- **Server side**
+  - Auto-binds matching devices to `usbip-host` as soon as they are plugged in
     (udev rule + dispatcher).
-  * Auto-unbinds (best-effort cleanup) when a managed device is unplugged.
-  * Binds devices that were already plugged in at boot (one-shot systemd unit).
-  * Runs `usbipd` in the foreground under systemd.
-* **Client side**
-  * Continuously polls the server's export list and `usbip attach`es matching
+  - Auto-unbinds (best-effort cleanup) when a managed device is unplugged.
+  - Binds devices that were already plugged in at boot (one-shot systemd unit).
+  - Runs `usbipd` in the foreground under systemd.
+- **Client side**
+  - Continuously polls the server's export list and `usbip attach`es matching
     devices through `vhci-hcd`.
-  * Detects when a device disappears locally (server reboot, network blip,
+  - Detects when a device disappears locally (server reboot, network blip,
     device unplugged at the server) and automatically re-attaches it once the
     server advertises it again.
 
@@ -46,19 +46,19 @@ autousbip/
 
 ## Prerequisites (target Linux host)
 
-* Kernel with `CONFIG_USBIP_CORE`, `CONFIG_USBIP_HOST` (server) and
+- Kernel with `CONFIG_USBIP_CORE`, `CONFIG_USBIP_HOST` (server) and
   `CONFIG_USBIP_VHCI_HCD` (client). On Debian/Ubuntu these are in the stock
   kernel; modules live in `linux-modules-extra-$(uname -r)` on Ubuntu.
-* The `usbip` userspace tool (Debian: `usbip-utils`, Arch: `usbip-utils`,
+- The `usbip` userspace tool (Debian: `usbip-utils`, Arch: `usbip-utils`,
   Fedora: `usbip-utils`). Provides both `usbip` and `usbipd`.
-* `lsusb` (from `usbutils`) on the client - optional but recommended for fast
+- `lsusb` (from `usbutils`) on the client - optional but recommended for fast
   attach verification. A sysfs fallback is used if it is missing.
 
 ## Quick start
 
 ```bash
 # On the SERVER host (the box that physically has the USB device):
-git clone <this repo> autousbip && cd autousbip
+git clone https://github.com/pneugebala/autousbip.git autousbip && cd autousbip
 sudo ./install.sh --server
 # Edit /etc/autousbip/server.conf and add the device's vid:pid.
 # Find it with `lsusb`, e.g.:
@@ -74,7 +74,7 @@ usbip list -l            # local list, should show "usbip-host" driver
 ss -ltnp | grep 3240     # usbipd listening
 
 # On the CLIENT host (the box that wants to USE the device):
-git clone <this repo> autousbip && cd autousbip
+git clone https://github.com/pneugebala/autousbip.git autousbip && cd autousbip
 sudo ./install.sh --client
 # Edit /etc/autousbip/client.conf to point at the server and list the same
 # vid:pid values.
@@ -94,7 +94,7 @@ lsusb                     # should now show the remote device locally
    `usbipd` (the USB/IP daemon, TCP 3240).
 2. `99-autousbip-server.rules` is a udev rule that matches every USB device
    (not interfaces) and invokes `autousbip-server udev-add <busid> <vid>
-   <pid>` on `add` and `autousbip-server udev-remove <busid>` on `remove`.
+<pid>` on `add` and `autousbip-server udev-remove <busid>` on `remove`.
 3. The dispatcher reads `/etc/autousbip/server.conf`. If the device's
    `vid:pid` is listed, it spawns a transient systemd unit
    (`autousbip-server-bind@<busid>.service`) that runs `usbip bind -b <busid>`
@@ -117,15 +117,15 @@ already-managed busid is also skipped.
 `autousbip-client.service` runs `/usr/local/sbin/autousbip-client`, a
 single long-running bash loop:
 
-* For each configured `vid:pid`, it asks the server `usbip list -r $SERVER`
+- For each configured `vid:pid`, it asks the server `usbip list -r $SERVER`
   and greps for `(vid:pid)`. The matching line gives the server-side busid.
-* It calls `usbip attach -r $SERVER -b <busid>` and waits for the device to
+- It calls `usbip attach -r $SERVER -b <busid>` and waits for the device to
   enumerate locally (checked via `lsusb` / sysfs fallback).
-* Once attached, the loop monitors the local device. When it disappears
+- Once attached, the loop monitors the local device. When it disappears
   (the remote end unplugged it, the server rebooted, or the network blipped),
   the loop cleans up the stale vhci port with `usbip detach -p <port>` and
   goes back to polling the server's export list.
-* The server doesn't have to be up when the client starts - the loop will
+- The server doesn't have to be up when the client starts - the loop will
   keep polling every `POLL_INTERVAL` seconds until it can reach it.
 
 State machine per device: `detached` -> `waiting` (not advertised) ->
@@ -172,24 +172,24 @@ journalctl -u autousbip-usbipd -u autousbip-server-boot -u autousbip-client -f
 
 ## Operating notes
 
-* The server-side udev rule matches ALL usb devices and asks the dispatcher
+- The server-side udev rule matches ALL usb devices and asks the dispatcher
   to consult the config - there is no per-device rule to regenerate when you
   edit `server.conf`. Just `udevadm control --reload-rules` (the dispatcher
   reads the config on every event) and you're done.
-* The client uses `usbip list -r $SERVER` to discover the server-side busid
-  of each device. This means the server must already have *bound* the device
+- The client uses `usbip list -r $SERVER` to discover the server-side busid
+  of each device. This means the server must already have _bound_ the device
   before the client can see it - the two sides are coordinated by the
   `vid:pid` tuple, not by a fixed busid (busids change when devices are
   moved to different ports).
-* The server does NOT expose the device to the network until `usbip bind`
+- The server does NOT expose the device to the network until `usbip bind`
   is run. `usbipd` only advertises bound devices. So if `usbipd` is up but
   nothing is bound, `usbip list -r` shows an empty export list.
-* `usbip` traffic is **unencrypted** on TCP 3240. Run it over a VPN or a
+- `usbip` traffic is **unencrypted** on TCP 3240. Run it over a VPN or a
   SSH tunnel if the network between the two hosts is not trusted.
-* For multiple distinct servers, copy `autousbip-client.service` to
+- For multiple distinct servers, copy `autousbip-client.service` to
   `autousbip-client@.service` and set `Environment=AUTOUSBIP_CLIENT_CONFIG=
-  /etc/autousbip/client-%i.conf` in a drop-in, then `systemctl enable --now
-  autousbip-client@sitea`.
+/etc/autousbip/client-%i.conf` in a drop-in, then `systemctl enable --now
+autousbip-client@sitea`.
 
 ## Uninstall
 
